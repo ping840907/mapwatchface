@@ -177,6 +177,11 @@ function getPlatform() {
   return 'basalt';
 }
 
+function getPlatformScreenSize(platform) {
+  var s = PLATFORM_SIZES[platform] || { w: 144, h: 168 };
+  return { w: s.w, h: s.h };
+}
+
 function getPlatformSize(platform) {
   var s = PLATFORM_SIZES[platform] || { w: 144, h: 168 };
   var crop = (s.h <= 168) ? ATTR_CROP_SMALL : ATTR_CROP;
@@ -512,48 +517,66 @@ function anyChanged(keys, oldS, newS) {
 function buildMapImage(arrayBuffer, render) {
   var decoded = UPNG.decode(arrayBuffer);          // parse the Geoapify PNG
   var w = decoded.width, h = decoded.height;
-  console.log('Geoapify returned ' + w + 'x' + h + (render.bw ? ' (b&w)' : ''));
-  var px = new Uint8Array(UPNG.toRGBA8(decoded)[0]); // first frame, RGBA bytes
 
-  for (var i = 0; i < px.length; i += 4) {
-    // Geoapify rendered each layer group as pure red, green, blue or black.
-    // Categorize the pixel based on its dominant channel.
-    var r = px[i], g = px[i + 1], b = px[i + 2];
-    var level = 0; // default to background (black)
+  // Determine target cropped screen dimensions.
+  // If targetSize is provided, crop the image centered so the watch receives
+  // an exact screen-sized PNG without the Geoapify attribution margins.
+  var targetW = (render && render.targetSize) ? Math.min(render.targetSize.w, w) : w;
+  var targetH = (render && render.targetSize) ? Math.min(render.targetSize.h, h) : h;
+  var cropX = Math.floor((w - targetW) / 2);
+  var cropY = Math.floor((h - targetH) / 2);
 
-    var max = Math.max(r, g, b);
-    var min = Math.min(r, g, b);
+  console.log('Geoapify returned ' + w + 'x' + h + ', cropping to ' + targetW + 'x' + targetH +
+              (render.bw ? ' (b&w)' : ''));
 
-    // Filter out very dark anti-aliasing artifacts from being classified as a color
-    if (max >= 43) {
-      if (max - min < 20) {
-        // Pixel is greyscale (like anti-aliased label halos against background or other bright artifacts)
-        if (max > 128) {
-          level = 3; // bright greyscale -> labels
-        } else {
-          level = 0; // dark greyscale -> background
+  var srcPx = new Uint8Array(UPNG.toRGBA8(decoded)[0]); // first frame, RGBA bytes
+  var dstPx = new Uint8Array(targetW * targetH * 4);
+
+  for (var y = 0; y < targetH; y++) {
+    var srcRow = ((cropY + y) * w + cropX) * 4;
+    var dstRow = y * targetW * 4;
+    for (var x = 0; x < targetW; x++) {
+      var sIdx = srcRow + (x * 4);
+      var dIdx = dstRow + (x * 4);
+
+      // Geoapify rendered each layer group as pure red, green, blue or black.
+      // Categorize the pixel based on its dominant channel.
+      var r = srcPx[sIdx], g = srcPx[sIdx + 1], b = srcPx[sIdx + 2];
+      var level = 0; // default to background (black)
+
+      var max = Math.max(r, g, b);
+      var min = Math.min(r, g, b);
+
+      // Filter out very dark anti-aliasing artifacts from being classified as a color
+      if (max >= 43) {
+        if (max - min < 20) {
+          // Pixel is greyscale (like anti-aliased label halos against background or other bright artifacts)
+          if (max > 128) {
+            level = 3; // bright greyscale -> labels
+          } else {
+            level = 0; // dark greyscale -> background
+          }
+        } else if (b === max) {
+          level = 3; // labels (blue)
+        } else if (g === max) {
+          level = 2; // roads (green)
+        } else if (r === max) {
+          level = 1; // water (red)
         }
-      } else if (b === max) {
-        level = 3; // labels (blue)
-      } else if (g === max) {
-        level = 2; // roads (green)
-      } else if (r === max) {
-        level = 1; // water (red)
       }
-    }
 
-    if (render.bw) {
-      var p = i >> 2;
-      var v = toneValue(render.tones[level], p % w, (p / w) | 0);
-      px[i] = v; px[i + 1] = v; px[i + 2] = v;
-    } else {
-      var c = render.palette[level];
-      px[i] = c.r; px[i + 1] = c.g; px[i + 2] = c.b;
+      if (render.bw) {
+        var v = toneValue(render.tones[level], x, y);
+        dstPx[dIdx] = v; dstPx[dIdx + 1] = v; dstPx[dIdx + 2] = v;
+      } else {
+        var c = render.palette[level];
+        dstPx[dIdx] = c.r; dstPx[dIdx + 1] = c.g; dstPx[dIdx + 2] = c.b;
+      }
+      dstPx[dIdx + 3] = 255;
     }
-    px[i + 3] = 255;
   }
 
-  return new Uint8Array(UPNG.encode([px.buffer], w, h, 0));
+  return new Uint8Array(UPNG.encode([dstPx.buffer], targetW, targetH, 0));
 }
 
 // ---------------------------------------------------------------------------
@@ -711,12 +734,15 @@ function performUpdate(force, streamCache) {
 
   var platform = getPlatform();
   var size = getPlatformSize(platform);
+  var screenSize = getPlatformScreenSize(platform);
   var render = {
     bw: isBwPlatform(platform),
     palette: getMapPalette(settings),
-    tones: getMapTones(settings)
+    tones: getMapTones(settings),
+    targetSize: screenSize
   };
   console.log('Platform ' + platform + ', map ' + size.w + 'x' + size.h +
+              ' (target ' + screenSize.w + 'x' + screenSize.h + ')' +
               (render.bw ? ' (b&w)' : ''));
   sendStatus('Locating...');
   resolveLocation(settings, function (err, loc) {

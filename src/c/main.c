@@ -43,8 +43,10 @@ static Layer *s_overlay_layer;    // draws the time/date overlay
 
 static GBitmap *s_map_bitmap = NULL;
 
-// Incoming image stream buffer
-static uint8_t *s_img_buffer = NULL;
+// Incoming image stream buffer. Pre-allocated with fixed capacity to avoid
+// dynamic malloc/free churn on the heap, which causes heap fragmentation.
+#define IMG_BUFFER_CAPACITY 8192
+static uint8_t s_img_buffer[IMG_BUFFER_CAPACITY];
 static uint32_t s_img_size = 0;
 static uint32_t s_img_received = 0;
 
@@ -458,21 +460,17 @@ static void overlay_update_proc(Layer *layer, GContext *ctx) {
 // ---------------------------------------------------------------------------
 
 static void reset_image_stream(void) {
-  if (s_img_buffer) {
-    free(s_img_buffer);
-    s_img_buffer = NULL;
-  }
   s_img_size = 0;
   s_img_received = 0;
 }
 
 static void finalize_image(void) {
-  if (!s_img_buffer) {
+  if (s_img_size == 0) {
     set_status("No buffer");
     return;
   }
 
-  // Capture the first bytes for an error message before the buffer is freed.
+  // Capture the first bytes for an error message before the buffer is reset.
   uint8_t b0 = s_img_size > 0 ? s_img_buffer[0] : 0;
   uint8_t b1 = s_img_size > 1 ? s_img_buffer[1] : 0;
   uint8_t b2 = s_img_size > 2 ? s_img_buffer[2] : 0;
@@ -483,6 +481,9 @@ static void finalize_image(void) {
   // Valid only if every byte arrived and the PNG signature is intact.
   bool ok = (recv >= total) && total >= 8 &&
             b0 == 0x89 && b1 == 0x50 && b2 == 0x4E && b3 == 0x47;
+
+  APP_LOG(APP_LOG_LEVEL_INFO, "Finalizing img: recv=%lu total=%lu free_heap=%lu",
+          (unsigned long)recv, (unsigned long)total, (unsigned long)heap_bytes_free());
 
   GBitmap *new_bitmap = NULL;
   if (ok) {
@@ -508,6 +509,8 @@ static void finalize_image(void) {
     layer_mark_dirty(s_canvas_layer);
     set_status(""); // success: clear status for a clean face
     s_img_retries = 0;
+    APP_LOG(APP_LOG_LEVEL_INFO, "Map loaded successfully. Free heap: %lu",
+            (unsigned long)heap_bytes_free());
   } else if (s_img_retries < MAX_IMG_RETRIES) {
     // Incomplete/corrupt: ask the phone to re-download (forced) and try again.
     s_img_retries++;
@@ -636,12 +639,11 @@ static void inbox_received_handler(DictionaryIterator *iter, void *context) {
   if (size_t) {
     reset_image_stream();
     s_img_size = size_t->value->uint32;
-    if (s_img_size > 0 && s_img_size < 256 * 1024) {
-      s_img_buffer = malloc(s_img_size);
-    }
-    if (!s_img_buffer) {
-      s_img_size = 0; // allocation failed; ignore the incoming stream
-      set_status("Img buffer fail");
+    if (s_img_size == 0 || s_img_size > IMG_BUFFER_CAPACITY) {
+      APP_LOG(APP_LOG_LEVEL_ERROR, "Image size %lu exceeds capacity %d",
+              (unsigned long)s_img_size, IMG_BUFFER_CAPACITY);
+      s_img_size = 0; // buffer capacity exceeded; reject stream
+      set_status("Img too large");
     } else {
       set_status("Loading map...");
     }
@@ -651,10 +653,10 @@ static void inbox_received_handler(DictionaryIterator *iter, void *context) {
   // Image stream control: a data chunk.
   Tuple *data_t = dict_find(iter, MESSAGE_KEY_IMG_DATA);
   Tuple *offset_t = dict_find(iter, MESSAGE_KEY_IMG_OFFSET);
-  if (data_t && offset_t && s_img_buffer) {
+  if (data_t && offset_t && s_img_size > 0) {
     uint32_t offset = offset_t->value->uint32;
     uint16_t len = data_t->length;
-    if (offset + len <= s_img_size) {
+    if (offset + len <= s_img_size && offset + len <= IMG_BUFFER_CAPACITY) {
       memcpy(s_img_buffer + offset, data_t->value->data, len);
       s_img_received += len;
     }
